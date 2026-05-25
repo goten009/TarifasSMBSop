@@ -1,9 +1,16 @@
 from pathlib import Path
+from io import BytesIO
+from datetime import datetime
 import re
 import unicodedata
+import zipfile
+import copy
 
 import pandas as pd
 import streamlit as st
+
+from PIL import Image
+from docx import Document
 
 
 # ============================================================
@@ -18,8 +25,24 @@ st.set_page_config(
 )
 
 BASE_DIR = Path(__file__).resolve().parent
+
 PRICE_FILE = BASE_DIR / "data" / "Lista de precios SOPHOS SMB.xlsx"
 LOGO_FILE = BASE_DIR / "assets" / "logo_mc.png"
+
+TEMPLATE_OFERTA_UTM_FILE = BASE_DIR / "assets" / "oferta_venta_utm.docx"
+TEMPLATE_SERVICIO_NGFW_FILE = BASE_DIR / "assets" / "oferta_servicio_ngfw.docx"
+TEMPLATE_ENDPOINT_FILE = BASE_DIR / "assets" / "oferta_endpoint.docx"
+
+WORD_MEDIA_FIREWALL_IMAGE_VENTA = "word/media/image2.png"
+WORD_MEDIA_FIREWALL_IMAGE_SERVICIO = "word/media/image2.jpeg"
+
+FIREWALL_IMAGE_FILES = {
+    "XGS 88": BASE_DIR / "assets" / "XGS88.jpg",
+    "XGS 108": BASE_DIR / "assets" / "XGS108.jpg",
+    "XGS 118": BASE_DIR / "assets" / "XGS118.jpg",
+    "XGS 128": BASE_DIR / "assets" / "XGS128.jpg",
+    "XGS 138": BASE_DIR / "assets" / "XGS138.jpg",
+}
 
 FAMILIAS_VALIDAS = [
     "Firewall",
@@ -35,12 +58,29 @@ VIGENCIAS_VALIDAS = [12, 24, 36]
 
 TIPOS_VENTA_FIREWALL = [
     "Venta one shot",
-    "Servicio mensual"
+    "Servicio mensual",
+]
+
+TIPOS_INSTALACION_LICENCIAS = [
+    "Sin instalación",
+    "Instalación básica (5 licencias)",
+    "Instalación completa",
+]
+
+TIPOS_INSTALACION_FIREWALL_SERVICIO = [
+    "Sin cobro de instalación",
+    "Con cobro de instalación",
+]
+
+TIPOS_INSTALACION_FIREWALL_VENTA = [
+    "Sin instalación",
+    "Instalación básica",
+    "Instalación completa",
 ]
 
 
 # ============================================================
-# VARIABLES FINANCIERAS FIJAS
+# VARIABLES FINANCIERAS
 # ============================================================
 
 IMPUESTOS = 0.012
@@ -53,7 +93,7 @@ PORCENTAJE_COSTO_INSTALACION = 0.10
 
 
 # ============================================================
-# TARIFAS SERVICIO FIREWALL
+# TARIFAS FIREWALL SERVICIO
 # ============================================================
 
 TARIFA_SERVICIO_FIREWALL = {
@@ -65,9 +105,24 @@ TARIFA_SERVICIO_FIREWALL = {
 }
 
 NRC_SERVICIO_FIREWALL = {
-    "Instalación completa": 350000,
-    "Instalación básica": 200000,
-    "Sin instalación": 0,
+    "Sin cobro de instalación": 0,
+    "Con cobro de instalación": 350000,
+}
+
+CAPACIDAD_FIREWALL = {
+    "XGS 88": 20,
+    "XGS 108": 40,
+    "XGS 118": 70,
+    "XGS 128": 100,
+    "XGS 138": 200,
+}
+
+MODELO_TABLA_SERVICIO = {
+    "XGS 88": "XGS88",
+    "XGS 108": "XGS108",
+    "XGS 118": "XGS118",
+    "XGS 128": "XGS128",
+    "XGS 138": "XGS138",
 }
 
 
@@ -120,13 +175,6 @@ st.markdown(
             padding: 28px 32px;
             margin-bottom: 24px;
             box-shadow: 0 12px 30px rgba(0, 57, 115, 0.08);
-        }
-
-        .mc-header-grid {
-            display: grid;
-            grid-template-columns: 320px 1fr;
-            gap: 32px;
-            align-items: center;
         }
 
         .mc-title {
@@ -241,50 +289,18 @@ st.markdown(
             border-top: 1px solid #D9E1EA;
         }
 
-        div[data-testid="stMetric"] {
-            background: #FFFFFF;
-            border: 1px solid #D9E1EA;
-            border-radius: 18px;
-            padding: 18px 18px 14px 18px;
-            box-shadow: 0 8px 24px rgba(0, 57, 115, 0.06);
-        }
-
-        div[data-testid="stMetric"] label {
-            color: #52616F !important;
-            font-weight: 700 !important;
-        }
-
-        div[data-testid="stMetricValue"] {
-            color: #1F2937 !important;
-            font-weight: 800 !important;
-        }
-
         div[data-testid="stDataFrame"] {
             border-radius: 16px;
             overflow: hidden;
         }
 
-        .stSelectbox label, .stNumberInput label {
+        .stSelectbox label, .stNumberInput label, .stCheckbox label {
             color: #374151 !important;
             font-weight: 700 !important;
         }
-
-        button[kind="primary"] {
-            background: #0057A8 !important;
-        }
-
-        @media (max-width: 900px) {
-            .mc-header-grid {
-                grid-template-columns: 1fr;
-            }
-
-            .mc-title {
-                font-size: 28px;
-            }
-        }
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
 
@@ -397,12 +413,724 @@ def render_result_card(label, value, note="", variant="blue"):
             <div class="mc-result-note">{note}</div>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
 
 # ============================================================
-# CARGA DE LISTA DE PRECIOS
+# FUNCIONES WORD GENERALES
+# ============================================================
+
+def obtener_imagen_firewall(modelo):
+    return FIREWALL_IMAGE_FILES.get(modelo)
+
+
+def convertir_imagen_a_bytes(image_path, formato="PNG"):
+    with Image.open(image_path) as img:
+        img = img.convert("RGB")
+        buffer = BytesIO()
+
+        if formato.upper() == "JPEG":
+            img.save(buffer, format="JPEG", quality=95)
+        else:
+            img.save(buffer, format="PNG")
+
+        buffer.seek(0)
+        return buffer.read()
+
+
+def aplicar_reemplazos_xml(texto_xml, reemplazos):
+    texto_modificado = texto_xml
+
+    for buscar, reemplazar in sorted(reemplazos.items(), key=lambda x: len(x[0]), reverse=True):
+        texto_modificado = texto_modificado.replace(buscar, reemplazar)
+
+    return texto_modificado
+
+
+def reemplazar_imagen_y_xml_docx(docx_buffer, image_path, reemplazos_xml, media_target=None, image_format="PNG"):
+    docx_buffer.seek(0)
+    output = BytesIO()
+
+    nueva_imagen = None
+
+    if image_path is not None and Path(image_path).exists():
+        nueva_imagen = convertir_imagen_a_bytes(image_path, formato=image_format)
+
+    with zipfile.ZipFile(docx_buffer, "r") as zin:
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+
+                if item.filename.endswith(".xml") and item.filename.startswith("word/"):
+                    try:
+                        xml_text = data.decode("utf-8")
+                        xml_text = aplicar_reemplazos_xml(xml_text, reemplazos_xml)
+                        data = xml_text.encode("utf-8")
+                    except UnicodeDecodeError:
+                        pass
+
+                if nueva_imagen is not None and media_target and item.filename == media_target:
+                    data = nueva_imagen
+
+                zout.writestr(item, data)
+
+    output.seek(0)
+    return output
+
+
+def reemplazar_texto_parrafo(paragraph, reemplazos):
+    texto_original = paragraph.text
+
+    if not texto_original:
+        return
+
+    texto_nuevo = texto_original
+
+    for buscar, reemplazar in sorted(reemplazos.items(), key=lambda x: len(x[0]), reverse=True):
+        texto_nuevo = texto_nuevo.replace(buscar, reemplazar)
+
+    if texto_nuevo == texto_original:
+        return
+
+    estilo = paragraph.style
+    alineacion = paragraph.alignment
+
+    for run in paragraph.runs:
+        run.text = ""
+
+    if paragraph.runs:
+        paragraph.runs[0].text = texto_nuevo
+    else:
+        paragraph.add_run(texto_nuevo)
+
+    paragraph.style = estilo
+    paragraph.alignment = alineacion
+
+
+def reemplazar_texto_documento(doc, reemplazos):
+    for paragraph in doc.paragraphs:
+        reemplazar_texto_parrafo(paragraph, reemplazos)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    reemplazar_texto_parrafo(paragraph, reemplazos)
+
+
+def limpiar_celda(cell):
+    for paragraph in cell.paragraphs:
+        for run in paragraph.runs:
+            run.text = ""
+
+    if not cell.paragraphs:
+        cell.add_paragraph()
+
+
+def escribir_celda(cell, texto):
+    limpiar_celda(cell)
+    paragraph = cell.paragraphs[0]
+
+    if paragraph.runs:
+        paragraph.runs[0].text = str(texto)
+    else:
+        paragraph.add_run(str(texto))
+
+
+def asegurar_columnas_tabla(table, cantidad_columnas):
+    """
+    Mantiene compatibilidad si alguna plantilla antigua no tiene las columnas requeridas.
+    Si la plantilla ya tiene 4 columnas, no hace nada.
+    """
+    while len(table.columns) < cantidad_columnas:
+        ultima_col_idx = len(table.columns) - 1
+
+        ancho_referencia = table.columns[ultima_col_idx].width
+        if ancho_referencia is None:
+            ancho_referencia = 1200000
+
+        table.add_column(ancho_referencia)
+
+        nueva_col_idx = len(table.columns) - 1
+
+        for row in table.rows:
+            celda_origen = row.cells[ultima_col_idx]
+            celda_destino = row.cells[nueva_col_idx]
+
+            tc_pr_origen = celda_origen._tc.get_or_add_tcPr()
+            tc_pr_destino = celda_destino._tc.get_or_add_tcPr()
+
+            for child in list(tc_pr_destino):
+                tc_pr_destino.remove(child)
+
+            for child in tc_pr_origen:
+                tc_pr_destino.append(copy.deepcopy(child))
+
+            if celda_origen.paragraphs and celda_destino.paragraphs:
+                celda_destino.paragraphs[0].style = celda_origen.paragraphs[0].style
+                celda_destino.paragraphs[0].alignment = celda_origen.paragraphs[0].alignment
+
+
+def eliminar_filas_extra(table, filas_deseadas):
+    while len(table.rows) > filas_deseadas:
+        row = table.rows[-1]
+        table._tbl.remove(row._tr)
+
+
+def nombre_archivo_oferta(modelo, modalidad):
+    modalidad_limpia = normalizar_texto(modalidad)
+    fecha = datetime.now().strftime("%Y%m%d")
+    modelo_limpio = str(modelo).replace(" ", "_")
+    return f"Oferta_Sophos_{modelo_limpio}_{modalidad_limpia}_{fecha}.docx"
+
+
+# ============================================================
+# WORD - VENTA UTM FIREWALL
+# ============================================================
+
+def encontrar_tabla_plataforma(doc):
+    for table in doc.tables:
+        if len(table.rows) >= 2 and len(table.columns) >= 2:
+            textos = []
+
+            for row in table.rows:
+                for cell in row.cells:
+                    textos.append(cell.text.strip())
+
+            joined = " ".join(textos).lower()
+
+            if "plataforma" in joined and "licencia" in joined:
+                return table
+
+    return None
+
+
+def encontrar_tabla_economica_venta(doc):
+    for table in doc.tables:
+        if len(table.rows) >= 2 and len(table.columns) >= 4:
+            encabezados = [cell.text.strip().lower() for cell in table.rows[0].cells]
+
+            if (
+                "descripción" in encabezados[0]
+                and "cant" in encabezados[1]
+                and "valor unitario" in encabezados[2]
+                and "valor total" in encabezados[3]
+            ):
+                return table
+
+    return None
+
+
+def actualizar_tabla_plataforma(doc, modelo, vigencia):
+    table = encontrar_tabla_plataforma(doc)
+
+    if table is None:
+        return
+
+    if len(table.rows) >= 1:
+        escribir_celda(table.rows[0].cells[0], "Plataforma")
+        escribir_celda(table.rows[0].cells[1], f"Sophos {modelo}")
+
+    if len(table.rows) >= 2:
+        escribir_celda(table.rows[1].cells[0], "Licenciamiento")
+        escribir_celda(table.rows[1].cells[1], f"Licencia Xstream Protection {vigencia} meses")
+
+
+def actualizar_tabla_economica_venta_utm(doc, datos):
+    table = encontrar_tabla_economica_venta(doc)
+
+    if table is None:
+        return False
+
+    filas = [
+        [
+            f"Sophos {datos['modelo']}",
+            "1",
+            formato_cop(datos["venta_equipo"]),
+            formato_cop(datos["venta_equipo"]),
+        ],
+        [
+            f"Licencia Xstream Protection {datos['vigencia']} meses",
+            "1",
+            formato_cop(datos["venta_licencia"]),
+            formato_cop(datos["venta_licencia"]),
+        ],
+    ]
+
+    if datos.get("venta_instalacion", 0) > 0:
+        filas.append(
+            [
+                "Instalación y puesta en marcha",
+                "1",
+                formato_cop(datos["venta_instalacion"]),
+                formato_cop(datos["venta_instalacion"]),
+            ]
+        )
+
+    filas_necesarias = 1 + len(filas)
+
+    while len(table.rows) < filas_necesarias:
+        table.add_row()
+
+    eliminar_filas_extra(table, filas_necesarias)
+
+    for idx, fila in enumerate(filas, start=1):
+        for col_idx, valor in enumerate(fila):
+            escribir_celda(table.rows[idx].cells[col_idx], valor)
+
+    return True
+
+
+def generar_oferta_venta_utm_word(datos):
+    if not TEMPLATE_OFERTA_UTM_FILE.exists():
+        return None
+
+    doc = Document(str(TEMPLATE_OFERTA_UTM_FILE))
+    fecha_actual = datetime.now().strftime("%d/%m/%Y")
+
+    reemplazos = {
+        "El cliente INDEX TECNOLOGIA requiere": "El cliente requiere",
+        "El cliente INDEX TECNOLOGÍA requiere": "El cliente requiere",
+        "INDEX TECNOLOGIA": "Cliente",
+        "INDEX TECNOLOGÍA": "Cliente",
+        "Pereira, 21 de nov. de 25": f"Pereira, {fecha_actual}",
+        "Edinson Rodriguez": "XXXX",
+        "Edinson Rodríguez": "XXXX",
+        "Edinson.rodriguez@mc.net.co": "XXXX",
+        "Edinson.Rodriguez@mc.net.co": "XXXX",
+        "edinson.rodriguez@mc.net.co": "XXXX",
+        "Sophos XGS 108": f"Sophos {datos['modelo']}",
+        "Sophos XGS 116": f"Sophos {datos['modelo']}",
+        "Licencia Xtream protection 12 meses": f"Licencia Xstream Protection {datos['vigencia']} meses",
+        "Licencia Xtream Protection": f"Licencia Xstream Protection {datos['vigencia']} meses",
+        "Licencia Xstream Protection 12 meses": f"Licencia Xstream Protection {datos['vigencia']} meses",
+    }
+
+    reemplazar_texto_documento(doc, reemplazos)
+    actualizar_tabla_plataforma(doc, datos["modelo"], datos["vigencia"])
+    actualizar_tabla_economica_venta_utm(doc, datos)
+
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+
+    imagen_firewall = obtener_imagen_firewall(datos["modelo"])
+
+    buffer = reemplazar_imagen_y_xml_docx(
+        docx_buffer=buffer,
+        image_path=imagen_firewall,
+        reemplazos_xml=reemplazos,
+        media_target=WORD_MEDIA_FIREWALL_IMAGE_VENTA,
+        image_format="PNG",
+    )
+
+    buffer.seek(0)
+    return buffer
+
+
+# ============================================================
+# WORD - SERVICIO NGFW FIREWALL
+# ============================================================
+
+def encontrar_tabla_preciario_servicio(doc):
+    for table in doc.tables:
+        texto = " ".join(cell.text.strip() for row in table.rows for cell in row.cells)
+        texto_norm = normalizar_texto(texto)
+
+        if "preciariongfwsophos" in texto_norm:
+            return table
+
+        if "mrr1ano" in texto_norm and "mrr2anos" in texto_norm and "mrr3anos" in texto_norm:
+            return table
+
+        if "xgs88" in texto_norm and "xgs108" in texto_norm and "xgs118" in texto_norm:
+            return table
+
+    return None
+
+
+def actualizar_tabla_preciario_servicio(doc, datos):
+    table = encontrar_tabla_preciario_servicio(doc)
+
+    if table is None:
+        return False
+
+    modelo = datos["modelo"]
+    modelo_tabla = MODELO_TABLA_SERVICIO.get(modelo, modelo.replace(" ", ""))
+    capacidad = CAPACIDAD_FIREWALL.get(modelo, datos.get("capacidad", "-"))
+
+    mrr_12 = TARIFA_SERVICIO_FIREWALL[modelo][12]
+    mrr_24 = TARIFA_SERVICIO_FIREWALL[modelo][24]
+    mrr_36 = TARIFA_SERVICIO_FIREWALL[modelo][36]
+
+    while len(table.rows) < 3:
+        table.add_row()
+
+    eliminar_filas_extra(table, 3)
+
+    if len(table.rows[0].cells) >= 1:
+        escribir_celda(table.rows[0].cells[0], "PRECIARIO NGFW SOPHOS")
+
+    headers = ["NGFW", "MRR 1 AÑO", "MRR 2 AÑOS", "MRR 3 AÑOS", "USUARIOS"]
+    values = [
+        modelo_tabla,
+        formato_cop(mrr_12),
+        formato_cop(mrr_24),
+        formato_cop(mrr_36),
+        str(capacidad),
+    ]
+
+    for idx, header in enumerate(headers):
+        if idx < len(table.rows[1].cells):
+            escribir_celda(table.rows[1].cells[idx], header)
+
+    for idx, value in enumerate(values):
+        if idx < len(table.rows[2].cells):
+            escribir_celda(table.rows[2].cells[idx], value)
+
+    return True
+
+
+def construir_reemplazos_servicio(datos):
+    fecha_actual = datetime.now().strftime("%d/%m/%Y")
+    modelo = datos["modelo"]
+    capacidad = datos.get("capacidad", CAPACIDAD_FIREWALL.get(modelo, "-"))
+
+    modelo_con_capacidad = f"SOPHOS {modelo} ({capacidad} Usuarios aproximadamente)"
+
+    reemplazos = {
+        "NOMBRE CLIENTE": "Cliente",
+        "XXXXXXX": "Cliente",
+        "El cliente XXXXXXX requiere": "El cliente requiere",
+        "Ciudad, fecha": f"Ciudad, {fecha_actual}",
+        "Persona a quien va dirigida": "XXXX",
+        "Cargo de la persona a quien va dirigida": "XXXX",
+        "Ciudad en donde se oferta el servicio": "XXXX",
+        "xxxxxxxxxxxx": "XXXX",
+        "3xxxxxxxxx": "XXXX",
+        "xxxx.xxxx@mc.net.co": "XXXX",
+        "XXXXXX": "XXXX",
+        "XXXXXXXXXXXXXX": "XXXX",
+        "XXXXXXXX": "XXXX",
+        "XXXXXXXX@mc.net.co": "XXXX",
+        "Oferta venta de licenciamiento de seguridad informática NGFW": "Oferta de servicio de seguridad informática NGFW",
+        "OFERTA venta de licenciamiento de seguridad informática NGFW": "Oferta de servicio de seguridad informática NGFW",
+        "SOPHOS XGS 88 (20 Usuarios aproximadamente)": modelo_con_capacidad,
+        "SOPHOS XGS88 (20 Usuarios aproximadamente)": modelo_con_capacidad,
+        "Licenciamiento Xtream Protection": "Licenciamiento Xstream Protection",
+        "Todos los equipos incluyen licencia Xtream Protection": "El equipo ofertado incluye licencia Xstream Protection",
+    }
+
+    return reemplazos
+
+
+def generar_oferta_servicio_ngfw_word(datos):
+    if not TEMPLATE_SERVICIO_NGFW_FILE.exists():
+        return None
+
+    doc = Document(str(TEMPLATE_SERVICIO_NGFW_FILE))
+    reemplazos = construir_reemplazos_servicio(datos)
+
+    reemplazar_texto_documento(doc, reemplazos)
+    actualizar_tabla_preciario_servicio(doc, datos)
+
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+
+    imagen_firewall = obtener_imagen_firewall(datos["modelo"])
+
+    buffer = reemplazar_imagen_y_xml_docx(
+        docx_buffer=buffer,
+        image_path=imagen_firewall,
+        reemplazos_xml=reemplazos,
+        media_target=WORD_MEDIA_FIREWALL_IMAGE_SERVICIO,
+        image_format="JPEG",
+    )
+
+    buffer.seek(0)
+    return buffer
+
+
+# ============================================================
+# WORD - ENDPOINT / SERVER / EDR / XDR
+# ============================================================
+
+def construir_reemplazos_endpoint():
+    fecha_actual = datetime.now().strftime("%d/%m/%Y")
+
+    return {
+        "FUNDACION AMANECER": "Cliente",
+        "FUNDACIÓN AMANECER": "Cliente",
+        "INDEX TECNOLOGIA": "Cliente",
+        "INDEX TECNOLOGÍA": "Cliente",
+        "NOMBRE CLIENTE": "Cliente",
+        "XXXXXXX": "Cliente",
+        "El cliente FUNDACION AMANECER requiere": "El cliente requiere",
+        "El cliente FUNDACIÓN AMANECER requiere": "El cliente requiere",
+        "Pereira, 21 de nov. de 25": f"Pereira, {fecha_actual}",
+        "Ciudad, fecha": f"Ciudad, {fecha_actual}",
+        "Edinson Rodriguez": "XXXX",
+        "Edinson Rodríguez": "XXXX",
+        "Edinson.rodriguez@mc.net.co": "XXXX",
+        "Edinson.Rodriguez@mc.net.co": "XXXX",
+        "edinson.rodriguez@mc.net.co": "XXXX",
+        "xxxxxxxxxxxx": "XXXX",
+        "3xxxxxxxxx": "XXXX",
+        "xxxx.xxxx@mc.net.co": "XXXX",
+        "XXXXXXXX@mc.net.co": "XXXX",
+        "XXXXXXXXXXXXXX": "XXXX",
+        "XXXXXXXX": "XXXX",
+    }
+
+
+def normalizar_titulo_endpoint(texto):
+    texto = texto.replace("–", "-").replace("—", "-")
+    return normalizar_texto(texto)
+
+
+def obtener_titulos_endpoint():
+    return {
+        "endpoint_user": [
+            "Sophos Endpoint – User",
+            "Sophos Endpoint - User",
+            "Endpoint – User",
+            "Endpoint - User",
+        ],
+        "endpoint_server": [
+            "Sophos Endpoint – Server",
+            "Sophos Endpoint - Server",
+            "Endpoint – Server",
+            "Endpoint - Server",
+        ],
+        "edr_user": [
+            "Sophos EDR – User",
+            "Sophos EDR - User",
+            "EDR – User",
+            "EDR - User",
+        ],
+        "edr_server": [
+            "Sophos EDR – Server",
+            "Sophos EDR - Server",
+            "EDR – Server",
+            "EDR - Server",
+        ],
+        "xdr_user": [
+            "Sophos XDR – User",
+            "Sophos XDR - User",
+            "XDR – User",
+            "XDR - User",
+        ],
+        "xdr_server": [
+            "Sophos XDR – Server",
+            "Sophos XDR - Server",
+            "XDR – Server",
+            "XDR - Server",
+        ],
+    }
+
+
+def detectar_seccion_endpoint(texto):
+    texto_norm = normalizar_titulo_endpoint(texto)
+    titulos = obtener_titulos_endpoint()
+
+    for key, variantes in titulos.items():
+        for variante in variantes:
+            if normalizar_titulo_endpoint(variante) in texto_norm:
+                return key
+
+    return None
+
+
+def es_fin_bloques_endpoint(texto):
+    texto_norm = normalizar_texto(texto)
+    patrones_fin = [
+        "plataformassoportadas",
+        "instalacion",
+        "soportetecnico",
+        "administracion",
+        "ofertaeconomica",
+        "propuestacomercial",
+        "condicionescomerciales",
+    ]
+    return any(p in texto_norm for p in patrones_fin)
+
+
+def obtener_texto_elemento(element):
+    textos = []
+    for node in element.iter():
+        if node.tag.endswith("}t") and node.text:
+            textos.append(node.text)
+    return " ".join(textos).strip()
+
+
+def eliminar_elemento(element):
+    parent = element.getparent()
+    if parent is not None:
+        parent.remove(element)
+
+
+def limpiar_secciones_endpoint(doc, secciones_a_conservar):
+    body = doc.element.body
+    elementos = list(body)
+
+    seccion_actual = None
+    eliminando = False
+
+    for element in elementos:
+        texto = obtener_texto_elemento(element)
+
+        if not texto:
+            if eliminando:
+                eliminar_elemento(element)
+            continue
+
+        if es_fin_bloques_endpoint(texto):
+            seccion_actual = None
+            eliminando = False
+            continue
+
+        seccion_detectada = detectar_seccion_endpoint(texto)
+
+        if seccion_detectada:
+            seccion_actual = seccion_detectada
+            eliminando = seccion_detectada not in secciones_a_conservar
+
+            if eliminando:
+                eliminar_elemento(element)
+
+            continue
+
+        if seccion_actual is not None and eliminando:
+            eliminar_elemento(element)
+
+
+def encontrar_tabla_economica_endpoint(doc):
+    for table in doc.tables:
+        texto = " ".join(cell.text.strip() for row in table.rows for cell in row.cells)
+        texto_norm = normalizar_texto(texto)
+
+        if "ofertaeconomica" in texto_norm:
+            return table
+
+        if "valorunitario" in texto_norm and "valortotal" in texto_norm:
+            return table
+
+        if "referencia" in texto_norm and "valortotal" in texto_norm:
+            return table
+
+        if "item" in texto_norm and "cantidad" in texto_norm and "vigencia" in texto_norm:
+            return table
+
+    return None
+
+
+def actualizar_tabla_economica_endpoint(doc, componentes, venta_instalacion):
+    table = encontrar_tabla_economica_endpoint(doc)
+
+    if table is None:
+        return False
+
+    asegurar_columnas_tabla(table, 4)
+
+    filas = []
+
+    for componente in componentes:
+        filas.append(
+            [
+                componente["descripcion"],
+                str(componente["cantidad"]),
+                f"{componente['vigencia']} meses",
+                formato_cop(componente["venta_cop"]),
+            ]
+        )
+
+    if venta_instalacion and venta_instalacion > 0:
+        filas.append(
+            [
+                "Servicios profesionales de instalación y puesta en marcha",
+                "1",
+                "Única vez",
+                formato_cop(venta_instalacion),
+            ]
+        )
+
+    total = sum(c["venta_cop"] for c in componentes) + (venta_instalacion or 0)
+
+    filas.append(
+        [
+            "Total a presentar al cliente",
+            "-",
+            "-",
+            formato_cop(total),
+        ]
+    )
+
+    filas_necesarias = 1 + len(filas)
+
+    while len(table.rows) < filas_necesarias:
+        table.add_row()
+
+    eliminar_filas_extra(table, filas_necesarias)
+
+    headers = ["Ítem", "Cantidad", "Vigencia", "Valor Total COP"]
+
+    for idx, header in enumerate(headers):
+        escribir_celda(table.rows[0].cells[idx], header)
+
+    for row_idx, fila in enumerate(filas, start=1):
+        for col_idx, valor in enumerate(fila):
+            escribir_celda(table.rows[row_idx].cells[col_idx], valor)
+
+    return True
+
+
+def key_seccion_endpoint(familia_excel):
+    mapping = {
+        "Endpoint": "endpoint_user",
+        "Server": "endpoint_server",
+        "EDR User": "edr_user",
+        "EDR Server": "edr_server",
+        "XDR User": "xdr_user",
+        "XDR Server": "xdr_server",
+    }
+    return mapping.get(familia_excel)
+
+
+def generar_oferta_endpoint_word(datos):
+    if not TEMPLATE_ENDPOINT_FILE.exists():
+        return None
+
+    doc = Document(str(TEMPLATE_ENDPOINT_FILE))
+
+    reemplazos = construir_reemplazos_endpoint()
+
+    reemplazar_texto_documento(doc, reemplazos)
+    limpiar_secciones_endpoint(doc, datos["secciones"])
+    actualizar_tabla_economica_endpoint(
+        doc=doc,
+        componentes=datos["componentes"],
+        venta_instalacion=datos["venta_instalacion"],
+    )
+
+    buffer = BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+
+    buffer = reemplazar_imagen_y_xml_docx(
+        docx_buffer=buffer,
+        image_path=None,
+        reemplazos_xml=reemplazos,
+        media_target=None,
+    )
+
+    buffer.seek(0)
+    return buffer
+
+
+# ============================================================
+# CARGA LISTA DE PRECIOS
 # ============================================================
 
 @st.cache_data
@@ -461,15 +1189,15 @@ def buscar_precio_firewall(df, columnas, modelo_sugerido, vigencia):
     modelo_norm = normalizar_texto(modelo_sugerido)
 
     filtro_equipo = (
-        (df_temp["_familia_norm"] == normalizar_texto("Firewall")) &
-        (df_temp["_producto_norm"].str.contains(modelo_norm, na=False)) &
-        (df_temp["_vigencia_num"] == 0)
+        (df_temp["_familia_norm"] == normalizar_texto("Firewall"))
+        & (df_temp["_producto_norm"].str.contains(modelo_norm, na=False))
+        & (df_temp["_vigencia_num"] == 0)
     )
 
     filtro_licencia = (
-        (df_temp["_familia_norm"] == normalizar_texto("Firewall")) &
-        (df_temp["_producto_norm"].str.contains(modelo_norm, na=False)) &
-        (df_temp["_vigencia_num"] == vigencia)
+        (df_temp["_familia_norm"] == normalizar_texto("Firewall"))
+        & (df_temp["_producto_norm"].str.contains(modelo_norm, na=False))
+        & (df_temp["_vigencia_num"] == vigencia)
     )
 
     fila_equipo = df_temp[filtro_equipo]
@@ -499,29 +1227,31 @@ def buscar_precio_firewall(df, columnas, modelo_sugerido, vigencia):
     if sku_col:
         skus = resultado[sku_col].dropna().astype(str).tolist()
 
-    detalle_firewall = pd.DataFrame([
-        {
-            "Concepto": "Equipo / Hardware",
-            "Modelo": modelo_sugerido,
-            "Vigencia": "Pago único",
-            "MSRP USD": formato_usd(msrp_equipo_usd),
-            "DR USD": formato_usd(dr_equipo_usd),
-        },
-        {
-            "Concepto": f"Licencia {vigencia} meses",
-            "Modelo": modelo_sugerido,
-            "Vigencia": f"{vigencia} meses",
-            "MSRP USD": formato_usd(msrp_licencia_usd),
-            "DR USD": formato_usd(dr_licencia_usd),
-        },
-        {
-            "Concepto": "Total equipo + licencia",
-            "Modelo": modelo_sugerido,
-            "Vigencia": f"{vigencia} meses",
-            "MSRP USD": formato_usd(msrp_total),
-            "DR USD": formato_usd(dr_total),
-        },
-    ])
+    detalle_firewall = pd.DataFrame(
+        [
+            {
+                "Concepto": "Equipo / Hardware",
+                "Modelo": modelo_sugerido,
+                "Vigencia": "Pago único",
+                "MSRP USD": formato_usd(msrp_equipo_usd),
+                "DR USD": formato_usd(dr_equipo_usd),
+            },
+            {
+                "Concepto": f"Licencia {vigencia} meses",
+                "Modelo": modelo_sugerido,
+                "Vigencia": f"{vigencia} meses",
+                "MSRP USD": formato_usd(msrp_licencia_usd),
+                "DR USD": formato_usd(dr_licencia_usd),
+            },
+            {
+                "Concepto": "Total equipo + licencia",
+                "Modelo": modelo_sugerido,
+                "Vigencia": f"{vigencia} meses",
+                "MSRP USD": formato_usd(msrp_total),
+                "DR USD": formato_usd(dr_total),
+            },
+        ]
+    )
 
     return {
         "producto": modelo_sugerido,
@@ -554,14 +1284,14 @@ def buscar_precio_licencia(df, columnas, familia, cantidad, vigencia):
     df_temp["_vigencia_num"] = df_temp[vigencia_col].apply(convertir_numero)
 
     resultado = df_temp[
-        (df_temp["_familia_norm"] == normalizar_texto(familia)) &
-        (df_temp["_vigencia_num"] == vigencia)
+        (df_temp["_familia_norm"] == normalizar_texto(familia))
+        & (df_temp["_vigencia_num"] == vigencia)
     ]
 
     if min_col and max_col:
         resultado = resultado[
-            (resultado[min_col].apply(convertir_numero) <= cantidad) &
-            (resultado[max_col].apply(convertir_numero) >= cantidad)
+            (resultado[min_col].apply(convertir_numero) <= cantidad)
+            & (resultado[max_col].apply(convertir_numero) >= cantidad)
         ]
 
     if resultado.empty:
@@ -581,17 +1311,15 @@ def buscar_precio_licencia(df, columnas, familia, cantidad, vigencia):
 
     return {
         "producto": fila[producto_col],
+        "familia": familia,
+        "cantidad": cantidad,
+        "vigencia": vigencia,
         "msrp_usd": msrp_unitario * cantidad,
         "dr_usd": dr_unitario * cantidad,
         "msrp_unitario_usd": msrp_unitario,
         "dr_unitario_usd": dr_unitario,
-        "msrp_equipo_usd": 0,
-        "dr_equipo_usd": 0,
-        "msrp_licencia_usd": msrp_unitario * cantidad,
-        "dr_licencia_usd": dr_unitario * cantidad,
         "skus": skus,
         "filas": resultado,
-        "detalle_firewall": None,
     }
 
 
@@ -657,17 +1385,34 @@ def calcular_financiero(msrp_usd, dr_usd, escenario, trm, tipo_instalacion):
     }
 
 
+def calcular_venta_componente(precio, escenario, trm):
+    costo_usd = obtener_costo_usd_por_escenario(
+        precio["msrp_usd"],
+        precio["dr_usd"],
+        escenario,
+    )
+
+    costo_cop = costo_usd * trm
+    venta_cop = calcular_precio_venta_desde_costo(costo_cop)
+
+    return {
+        "costo_usd": costo_usd,
+        "costo_cop": costo_cop,
+        "venta_cop": venta_cop,
+    }
+
+
 def calcular_detalle_venta_firewall(precio, escenario, trm):
     costo_equipo_usd = obtener_costo_usd_por_escenario(
         precio["msrp_equipo_usd"],
         precio["dr_equipo_usd"],
-        escenario
+        escenario,
     )
 
     costo_licencia_usd = obtener_costo_usd_por_escenario(
         precio["msrp_licencia_usd"],
         precio["dr_licencia_usd"],
-        escenario
+        escenario,
     )
 
     costo_equipo_cop = costo_equipo_usd * trm
@@ -710,7 +1455,7 @@ def calcular_servicio_firewall(modelo, vigencia, tipo_instalacion, cantidad_fire
 
 
 # ============================================================
-# ENCABEZADO CORPORATIVO
+# HEADER
 # ============================================================
 
 st.markdown('<div class="mc-header">', unsafe_allow_html=True)
@@ -737,14 +1482,14 @@ with header_col2:
             <div class="mc-badge">Modelo financiero controlado</div>
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
-st.markdown('</div>', unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ============================================================
-# INTERFAZ
+# CARGA EXCEL
 # ============================================================
 
 df_precios, hoja_usada = cargar_lista_precios()
@@ -773,15 +1518,16 @@ st.markdown(
         Lista de precios cargada correctamente desde la hoja: <strong>{hoja_usada}</strong>
     </div>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
+
+
+# ============================================================
+# FORMULARIO PRINCIPAL
+# ============================================================
 
 st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
 st.markdown('<div class="mc-section-title">Parámetros de cotización</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="mc-section-caption">Seleccione la familia, vigencia, escenario comercial y condiciones del servicio.</div>',
-    unsafe_allow_html=True
-)
 
 col1, col2, col3, col4 = st.columns(4)
 
@@ -789,14 +1535,30 @@ with col1:
     familia = st.selectbox("Familia", FAMILIAS_VALIDAS)
 
 with col2:
-    label_cantidad = "Cantidad de usuarios" if familia == "Firewall" else "Cantidad"
-    cantidad = st.number_input(
-        label_cantidad,
-        min_value=1,
-        max_value=10000,
-        value=20 if familia == "Firewall" else 1,
-        step=1
-    )
+    if familia == "Firewall":
+        cantidad = st.number_input(
+            "Cantidad de usuarios",
+            min_value=1,
+            max_value=10000,
+            value=20,
+            step=1,
+        )
+    elif familia in ["Server", "EDR Server", "XDR Server"]:
+        cantidad_usuarios_endpoint = st.number_input(
+            "Cantidad de servidores",
+            min_value=1,
+            max_value=10000,
+            value=1,
+            step=1,
+        )
+    else:
+        cantidad_usuarios_endpoint = st.number_input(
+            "Cantidad de usuarios",
+            min_value=1,
+            max_value=10000,
+            value=100,
+            step=1,
+        )
 
 with col3:
     vigencia = st.selectbox("Vigencia", VIGENCIAS_VALIDAS, index=0)
@@ -805,6 +1567,9 @@ with col4:
     trm = st.number_input("TRM", min_value=1.0, value=3800.0, step=10.0)
 
 tipo_venta_firewall = "Venta one shot"
+cantidad_firewalls = 1
+incluye_server = False
+cantidad_servidores = 0
 
 if familia == "Firewall":
     col_fw_1, col_fw_2, col_fw_3 = st.columns(3)
@@ -813,7 +1578,7 @@ if familia == "Firewall":
         tipo_venta_firewall = st.selectbox(
             "Tipo de venta Firewall",
             TIPOS_VENTA_FIREWALL,
-            index=0
+            index=0,
         )
 
     with col_fw_2:
@@ -822,13 +1587,38 @@ if familia == "Firewall":
             min_value=1,
             max_value=5,
             value=1,
-            step=1
+            step=1,
         )
 
     with col_fw_3:
-        st.info("Para servicio mensual se usa la tarifa MRC/NRC del marco tarifario.")
+        st.info("Para servicio mensual se usa tarifa MRC/NRC del marco tarifario.")
+
 else:
-    cantidad_firewalls = 1
+    incluye_server = False
+    cantidad_servidores = 0
+
+    if familia in ["Endpoint", "EDR User", "XDR User"]:
+        col_ep_1, col_ep_2 = st.columns(2)
+
+        with col_ep_1:
+            incluye_server = st.checkbox(
+                "Incluir licencias Server relacionadas",
+                value=False,
+                help="La vigencia de Server será obligatoriamente la misma seleccionada para usuarios.",
+            )
+
+        with col_ep_2:
+            if incluye_server:
+                cantidad_servidores = st.number_input(
+                    "Cantidad de servidores",
+                    min_value=1,
+                    max_value=10000,
+                    value=1,
+                    step=1,
+                )
+
+    elif familia in ["Server", "EDR Server", "XDR Server"]:
+        st.info("Cotización exclusiva de licencias Server. La vigencia seleccionada aplica a esta solución.")
 
 col5, col6 = st.columns(2)
 
@@ -836,26 +1626,37 @@ with col5:
     escenario = st.selectbox(
         "Estado de oportunidad",
         ["Sin DR aprobado", "Con DR aprobado"],
-        index=1
+        index=1,
     )
 
 with col6:
-    tipo_instalacion = st.selectbox(
-        "Tipo de instalación",
-        ["Sin instalación", "Instalación básica", "Instalación completa"],
-        index=1
-    )
+    if familia == "Firewall" and tipo_venta_firewall == "Servicio mensual":
+        tipo_instalacion = st.selectbox(
+            "Implementación",
+            TIPOS_INSTALACION_FIREWALL_SERVICIO,
+            index=0,
+        )
 
-st.markdown('</div>', unsafe_allow_html=True)
+    elif familia == "Firewall" and tipo_venta_firewall == "Venta one shot":
+        tipo_instalacion = st.selectbox(
+            "Tipo de instalación",
+            TIPOS_INSTALACION_FIREWALL_VENTA,
+            index=1,
+        )
+
+    else:
+        tipo_instalacion = st.selectbox(
+            "Tipo de instalación",
+            TIPOS_INSTALACION_LICENCIAS,
+            index=1,
+        )
+
+st.markdown("</div>", unsafe_allow_html=True)
 
 
 # ============================================================
-# CÁLCULO SEGÚN FAMILIA
+# FLUJO FIREWALL
 # ============================================================
-
-precio = None
-modelo_sugerido = None
-capacidad_sugerida = None
 
 if familia == "Firewall":
     modelo_sugerido, capacidad_sugerida = sugerir_firewall(cantidad)
@@ -874,183 +1675,132 @@ if familia == "Firewall":
             para hasta <strong>{capacidad_sugerida} usuarios Full UTM</strong>.
         </div>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     precio = buscar_precio_firewall(
         df=df_precios,
         columnas=columnas,
         modelo_sugerido=modelo_sugerido,
-        vigencia=vigencia
-    )
-else:
-    precio = buscar_precio_licencia(
-        df=df_precios,
-        columnas=columnas,
-        familia=familia,
-        cantidad=cantidad,
-        vigencia=vigencia
-    )
-
-if precio is None:
-    st.error(
-        "No se encontró precio para la combinación seleccionada. "
-        "Revisa familia, cantidad, vigencia o estructura del archivo Excel."
-    )
-    st.stop()
-
-
-# ============================================================
-# MODO SERVICIO FIREWALL
-# ============================================================
-
-if familia == "Firewall" and tipo_venta_firewall == "Servicio mensual":
-    servicio = calcular_servicio_firewall(
-        modelo=modelo_sugerido,
         vigencia=vigencia,
-        tipo_instalacion=tipo_instalacion,
-        cantidad_firewalls=cantidad_firewalls
     )
 
-    st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
-    st.markdown('<div class="mc-section-title">Resultado general · Servicio mensual</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="mc-section-caption">Resumen económico del servicio en modalidad MRC/NRC.</div>',
-        unsafe_allow_html=True
-    )
+    if precio is None:
+        st.error("No se encontró precio para la combinación seleccionada.")
+        st.stop()
 
-    s1, s2, s3, s4 = st.columns(4)
-
-    with s1:
-        render_result_card("MRC mensual", formato_cop(servicio["mrc_total"]), "Cargo mensual recurrente", "blue")
-
-    with s2:
-        render_result_card("NRC instalación", formato_cop(servicio["nrc_total"]), "Cargo único de instalación", "yellow")
-
-    with s3:
-        render_result_card(
-            f"Valor MRC {vigencia} meses",
-            formato_cop(servicio["valor_contrato_mrc"]),
-            "Valor acumulado del servicio",
-            "blue"
+    if tipo_venta_firewall == "Servicio mensual":
+        servicio = calcular_servicio_firewall(
+            modelo=modelo_sugerido,
+            vigencia=vigencia,
+            tipo_instalacion=tipo_instalacion,
+            cantidad_firewalls=cantidad_firewalls,
         )
 
-    with s4:
-        render_result_card("Total contrato", formato_cop(servicio["valor_total_contrato"]), "MRC contrato + NRC", "green")
+        st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
+        st.markdown('<div class="mc-section-title">Resultado general · Servicio mensual</div>', unsafe_allow_html=True)
 
-    st.markdown('</div>', unsafe_allow_html=True)
+        s1, s2, s3, s4 = st.columns(4)
 
-    st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
-    st.markdown('<div class="mc-section-title">Detalle del servicio firewall</div>', unsafe_allow_html=True)
+        with s1:
+            render_result_card("MRC mensual", formato_cop(servicio["mrc_total"]), "Cargo mensual recurrente", "blue")
 
-    tabla_servicio = pd.DataFrame([
-        {"Concepto": "Equipo sugerido", "Valor": f"Sophos {modelo_sugerido}"},
-        {"Concepto": "Cantidad de usuarios", "Valor": cantidad},
-        {"Concepto": "Capacidad de referencia", "Valor": f"Hasta {capacidad_sugerida} usuarios Full UTM"},
-        {"Concepto": "Cantidad de firewalls", "Valor": cantidad_firewalls},
-        {"Concepto": "Vigencia", "Valor": f"{vigencia} meses"},
-        {"Concepto": "MRC unitario", "Valor": formato_cop(servicio["mrc_unitario"])},
-        {"Concepto": "MRC total mensual", "Valor": formato_cop(servicio["mrc_total"])},
-        {"Concepto": "NRC unitario", "Valor": formato_cop(servicio["nrc_unitario"])},
-        {"Concepto": "NRC total", "Valor": formato_cop(servicio["nrc_total"])},
-        {"Concepto": "Valor MRC contrato", "Valor": formato_cop(servicio["valor_contrato_mrc"])},
-        {"Concepto": "Total contrato", "Valor": formato_cop(servicio["valor_total_contrato"])},
-    ])
+        with s2:
+            render_result_card("NRC instalación", formato_cop(servicio["nrc_total"]), tipo_instalacion, "yellow")
 
-    st.dataframe(tabla_servicio, use_container_width=True, hide_index=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+        with s3:
+            render_result_card(
+                f"Valor MRC {vigencia} meses",
+                formato_cop(servicio["valor_contrato_mrc"]),
+                "Valor acumulado del servicio",
+                "blue",
+            )
 
-    st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
-    st.markdown('<div class="mc-section-title">Resumen comercial</div>', unsafe_allow_html=True)
+        with s4:
+            render_result_card("Total contrato", formato_cop(servicio["valor_total_contrato"]), "MRC contrato + NRC", "green")
 
-    tabla_resumen_servicio = pd.DataFrame([
-        {
-            "Ítem": f"Servicio mensual Sophos {modelo_sugerido}",
-            "Tipo": "MRC",
-            "Cantidad": cantidad_firewalls,
-            "Valor unitario": formato_cop(servicio["mrc_unitario"]),
-            "Valor mensual": formato_cop(servicio["mrc_total"]),
-            "Valor contrato": formato_cop(servicio["valor_contrato_mrc"]),
-        },
-        {
-            "Ítem": "Instalación",
-            "Tipo": "NRC",
-            "Cantidad": cantidad_firewalls,
-            "Valor unitario": formato_cop(servicio["nrc_unitario"]),
-            "Valor mensual": "-",
-            "Valor contrato": formato_cop(servicio["nrc_total"]),
-        },
-        {
-            "Ítem": "Total a presentar al cliente",
-            "Tipo": "Total",
-            "Cantidad": "-",
-            "Valor unitario": "-",
-            "Valor mensual": formato_cop(servicio["mrc_total"]),
-            "Valor contrato": formato_cop(servicio["valor_total_contrato"]),
-        },
-    ])
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.dataframe(tabla_resumen_servicio, use_container_width=True, hide_index=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
+        st.markdown('<div class="mc-section-title">Generar oferta comercial</div>', unsafe_allow_html=True)
 
-    if servicio["mrc_total"] > 0:
-        st.success("Servicio mensual calculado correctamente con base en el marco tarifario.")
-    else:
-        st.error("No se encontró tarifa MRC para el equipo y vigencia seleccionados.")
+        datos_oferta_servicio = {
+            "modalidad": "Servicio mensual",
+            "modelo": modelo_sugerido,
+            "usuarios": cantidad,
+            "capacidad": capacidad_sugerida,
+            "vigencia": vigencia,
+            "tipo_instalacion": tipo_instalacion,
+            "cantidad_firewalls": cantidad_firewalls,
+            "mrc_unitario": servicio["mrc_unitario"],
+            "mrc_total": servicio["mrc_total"],
+            "nrc_unitario": servicio["nrc_unitario"],
+            "nrc_total": servicio["nrc_total"],
+            "valor_contrato_mrc": servicio["valor_contrato_mrc"],
+            "valor_total_contrato": servicio["valor_total_contrato"],
+        }
 
-    with st.expander("Validación técnica servicio firewall"):
-        st.write("Tabla MRC usada:")
-        st.write(TARIFA_SERVICIO_FIREWALL)
-        st.write("Tabla NRC usada:")
-        st.write(NRC_SERVICIO_FIREWALL)
-        st.write("Resultado del cálculo:")
-        st.write(servicio)
+        if not TEMPLATE_SERVICIO_NGFW_FILE.exists():
+            st.error("No se encontró assets/oferta_servicio_ngfw.docx")
+        else:
+            archivo_servicio = generar_oferta_servicio_ngfw_word(datos_oferta_servicio)
 
-    st.markdown(
-        '<div class="mc-footer-note">Media Commerce · Herramienta interna de estimación comercial</div>',
-        unsafe_allow_html=True
+            st.download_button(
+                label="📄 Generar oferta de servicio NGFW en Word",
+                data=archivo_servicio,
+                file_name=nombre_archivo_oferta(modelo_sugerido, "Servicio mensual"),
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True,
+            )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
+        st.markdown('<div class="mc-section-title">Detalle del servicio firewall</div>', unsafe_allow_html=True)
+
+        tabla_servicio = pd.DataFrame(
+            [
+                {"Concepto": "Equipo sugerido", "Valor": f"Sophos {modelo_sugerido}"},
+                {"Concepto": "Cantidad de usuarios", "Valor": cantidad},
+                {"Concepto": "Capacidad de referencia", "Valor": f"Hasta {capacidad_sugerida} usuarios Full UTM"},
+                {"Concepto": "Cantidad de firewalls", "Valor": cantidad_firewalls},
+                {"Concepto": "Vigencia", "Valor": f"{vigencia} meses"},
+                {"Concepto": "Implementación", "Valor": tipo_instalacion},
+                {"Concepto": "MRC unitario", "Valor": formato_cop(servicio["mrc_unitario"])},
+                {"Concepto": "MRC total mensual", "Valor": formato_cop(servicio["mrc_total"])},
+                {"Concepto": "NRC unitario", "Valor": formato_cop(servicio["nrc_unitario"])},
+                {"Concepto": "NRC total", "Valor": formato_cop(servicio["nrc_total"])},
+                {"Concepto": "Valor MRC contrato", "Valor": formato_cop(servicio["valor_contrato_mrc"])},
+                {"Concepto": "Total contrato", "Valor": formato_cop(servicio["valor_total_contrato"])},
+            ]
+        )
+
+        st.dataframe(tabla_servicio, use_container_width=True, hide_index=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        st.stop()
+
+    # Venta one shot firewall
+    msrp_usd = precio["msrp_usd"]
+    dr_usd = precio["dr_usd"]
+
+    resultado = calcular_financiero(
+        msrp_usd=msrp_usd,
+        dr_usd=dr_usd,
+        escenario=escenario,
+        trm=trm,
+        tipo_instalacion=tipo_instalacion,
     )
 
-    st.stop()
-
-
-# ============================================================
-# MODO ONE SHOT / OTRAS FAMILIAS
-# ============================================================
-
-msrp_usd = precio["msrp_usd"]
-dr_usd = precio["dr_usd"]
-
-resultado = calcular_financiero(
-    msrp_usd=msrp_usd,
-    dr_usd=dr_usd,
-    escenario=escenario,
-    trm=trm,
-    tipo_instalacion=tipo_instalacion
-)
-
-detalle_venta_firewall = None
-
-if familia == "Firewall":
     detalle_venta_firewall = calcular_detalle_venta_firewall(
         precio=precio,
         escenario=escenario,
-        trm=trm
+        trm=trm,
     )
 
+    st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
+    st.markdown('<div class="mc-section-title">Resultado general</div>', unsafe_allow_html=True)
 
-# ============================================================
-# RESULTADO GENERAL
-# ============================================================
-
-st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
-st.markdown('<div class="mc-section-title">Resultado general</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="mc-section-caption">Valores estimados para presentar internamente y validar la rentabilidad del negocio.</div>',
-    unsafe_allow_html=True
-)
-
-if familia == "Firewall":
     m1, m2, m3, m4 = st.columns(4)
 
     with m1:
@@ -1061,75 +1811,48 @@ if familia == "Firewall":
             f"Venta licencia {vigencia} meses",
             formato_cop(detalle_venta_firewall["venta_licencia_cop"]),
             "Suscripción seleccionada",
-            "blue"
+            "blue",
         )
 
     with m3:
-        render_result_card("Venta instalación", formato_cop(resultado["precio_venta_instalacion_cop"]), "Servicio profesional", "yellow")
+        render_result_card("Venta instalación", formato_cop(resultado["precio_venta_instalacion_cop"]), tipo_instalacion, "yellow")
 
     with m4:
         render_result_card("Total cliente", formato_cop(resultado["precio_venta_total_cop"]), "Valor total estimado", "green")
 
-    m5, m6, m7, m8 = st.columns(4)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    with m5:
-        render_result_card("Costo total", formato_cop(resultado["costo_total_cop"]), "Base de costo", "blue")
+    st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
+    st.markdown('<div class="mc-section-title">Generar oferta comercial</div>', unsafe_allow_html=True)
 
-    with m6:
-        render_result_card("Utilidad EBIT", formato_cop(resultado["utilidad_ebit_cop"]), "Resultado operativo estimado", "green")
+    datos_oferta_utm = {
+        "modalidad": "Venta one shot",
+        "modelo": modelo_sugerido,
+        "usuarios": cantidad,
+        "capacidad": capacidad_sugerida,
+        "vigencia": vigencia,
+        "tipo_instalacion": tipo_instalacion,
+        "venta_equipo": detalle_venta_firewall["venta_equipo_cop"],
+        "venta_licencia": detalle_venta_firewall["venta_licencia_cop"],
+        "venta_instalacion": resultado["precio_venta_instalacion_cop"],
+        "total_cliente": resultado["precio_venta_total_cop"],
+    }
 
-    with m7:
-        render_result_card("EBIT / Costo", formato_porcentaje(resultado["ebit_sobre_costo"]), "Rentabilidad sobre costo", "green")
+    if not TEMPLATE_OFERTA_UTM_FILE.exists():
+        st.error("No se encontró assets/oferta_venta_utm.docx")
+    else:
+        archivo_word = generar_oferta_venta_utm_word(datos_oferta_utm)
 
-    with m8:
-        render_result_card("Margen EBIT", formato_porcentaje(resultado["porcentaje_ebit"]), "Sobre precio de venta", "blue")
-else:
-    m1, m2, m3, m4 = st.columns(4)
-
-    with m1:
-        render_result_card(
-            "Venta licencias / producto",
-            formato_cop(resultado["precio_venta_licencias_cop"]),
-            "Valor comercial estimado",
-            "blue"
+        st.download_button(
+            label="📄 Generar oferta de venta UTM en Word",
+            data=archivo_word,
+            file_name=nombre_archivo_oferta(modelo_sugerido, "Venta one shot"),
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
         )
 
-    with m2:
-        render_result_card("Venta instalación", formato_cop(resultado["precio_venta_instalacion_cop"]), "Servicio profesional", "yellow")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    with m3:
-        render_result_card("Total cliente", formato_cop(resultado["precio_venta_total_cop"]), "Valor total estimado", "green")
-
-    with m4:
-        render_result_card("EBIT / Costo", formato_porcentaje(resultado["ebit_sobre_costo"]), "Rentabilidad sobre costo", "green")
-
-    m5, m6, m7, m8 = st.columns(4)
-
-    with m5:
-        render_result_card("Costo total", formato_cop(resultado["costo_total_cop"]), "Base de costo", "blue")
-
-    with m6:
-        render_result_card("Utilidad EBIT", formato_cop(resultado["utilidad_ebit_cop"]), "Resultado operativo estimado", "green")
-
-    with m7:
-        render_result_card("Margen EBIT", formato_porcentaje(resultado["porcentaje_ebit"]), "Sobre precio de venta", "blue")
-
-    with m8:
-        render_result_card(
-            "Margen contribucional",
-            formato_porcentaje(resultado["porcentaje_margen_contribucional"]),
-            "Después de impuestos y gastos",
-            "blue"
-        )
-
-st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ============================================================
-# DETALLE FIREWALL
-# ============================================================
-
-if familia == "Firewall":
     st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
     st.markdown('<div class="mc-section-title">Detalle Firewall: equipo y licencia</div>', unsafe_allow_html=True)
 
@@ -1154,161 +1877,337 @@ if familia == "Firewall":
     ]
 
     st.dataframe(detalle_fw, use_container_width=True, hide_index=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.stop()
 
 
 # ============================================================
-# DETALLE DE PRODUCTO
+# FLUJO ENDPOINT / SERVER / EDR / XDR
 # ============================================================
+
+componentes_a_cotizar = []
+
+if familia == "Endpoint":
+    componentes_a_cotizar.append(
+        {
+            "familia_excel": "Endpoint",
+            "cantidad": cantidad_usuarios_endpoint,
+            "descripcion": "Sophos Endpoint – User",
+        }
+    )
+
+    if incluye_server:
+        componentes_a_cotizar.append(
+            {
+                "familia_excel": "Server",
+                "cantidad": cantidad_servidores,
+                "descripcion": "Sophos Endpoint – Server",
+            }
+        )
+
+elif familia == "Server":
+    componentes_a_cotizar.append(
+        {
+            "familia_excel": "Server",
+            "cantidad": cantidad_usuarios_endpoint,
+            "descripcion": "Sophos Endpoint – Server",
+        }
+    )
+
+elif familia == "EDR User":
+    componentes_a_cotizar.append(
+        {
+            "familia_excel": "EDR User",
+            "cantidad": cantidad_usuarios_endpoint,
+            "descripcion": "Sophos EDR – User",
+        }
+    )
+
+    if incluye_server:
+        componentes_a_cotizar.append(
+            {
+                "familia_excel": "EDR Server",
+                "cantidad": cantidad_servidores,
+                "descripcion": "Sophos EDR – Server",
+            }
+        )
+
+elif familia == "EDR Server":
+    componentes_a_cotizar.append(
+        {
+            "familia_excel": "EDR Server",
+            "cantidad": cantidad_usuarios_endpoint,
+            "descripcion": "Sophos EDR – Server",
+        }
+    )
+
+elif familia == "XDR User":
+    componentes_a_cotizar.append(
+        {
+            "familia_excel": "XDR User",
+            "cantidad": cantidad_usuarios_endpoint,
+            "descripcion": "Sophos XDR – User",
+        }
+    )
+
+    if incluye_server:
+        componentes_a_cotizar.append(
+            {
+                "familia_excel": "XDR Server",
+                "cantidad": cantidad_servidores,
+                "descripcion": "Sophos XDR – Server",
+            }
+        )
+
+elif familia == "XDR Server":
+    componentes_a_cotizar.append(
+        {
+            "familia_excel": "XDR Server",
+            "cantidad": cantidad_usuarios_endpoint,
+            "descripcion": "Sophos XDR – Server",
+        }
+    )
+
+
+precios_componentes = []
+
+for componente in componentes_a_cotizar:
+    precio_componente = buscar_precio_licencia(
+        df=df_precios,
+        columnas=columnas,
+        familia=componente["familia_excel"],
+        cantidad=componente["cantidad"],
+        vigencia=vigencia,
+    )
+
+    if precio_componente is None:
+        st.error(f"No se encontró precio para {componente['familia_excel']}.")
+        st.stop()
+
+    precio_componente["descripcion"] = componente["descripcion"]
+    precios_componentes.append(precio_componente)
+
+
+msrp_total = sum(p["msrp_usd"] for p in precios_componentes)
+dr_total = sum(p["dr_usd"] for p in precios_componentes)
+
+resultado = calcular_financiero(
+    msrp_usd=msrp_total,
+    dr_usd=dr_total,
+    escenario=escenario,
+    trm=trm,
+    tipo_instalacion=tipo_instalacion,
+)
+
+detalle_componentes = []
+
+for p in precios_componentes:
+    venta = calcular_venta_componente(p, escenario, trm)
+
+    detalle_componentes.append(
+        {
+            "familia": p["familia"],
+            "descripcion": p["descripcion"],
+            "producto": p["producto"],
+            "cantidad": p["cantidad"],
+            "vigencia": p["vigencia"],
+            "msrp_usd": p["msrp_usd"],
+            "dr_usd": p["dr_usd"],
+            "venta_cop": venta["venta_cop"],
+            "costo_cop": venta["costo_cop"],
+        }
+    )
+
 
 st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
-st.markdown('<div class="mc-section-title">Detalle de producto cotizado</div>', unsafe_allow_html=True)
+st.markdown('<div class="mc-section-title">Resultado general Endpoint</div>', unsafe_allow_html=True)
 
-detalle_producto = {
-    "Familia": familia,
-    "Producto": precio["producto"],
-    "Cantidad de usuarios" if familia == "Firewall" else "Cantidad": cantidad,
-    "Vigencia": f"{vigencia} meses",
-    "Escenario": escenario,
-    "Tipo instalación": tipo_instalacion,
-    "SKU(s)": ", ".join(precio["skus"]) if precio["skus"] else "-",
-    "MSRP USD total": formato_usd(msrp_usd),
-    "DR USD total": formato_usd(dr_usd),
-    "MSRP USD unitario": formato_usd(precio["msrp_unitario_usd"]),
-    "DR USD unitario": formato_usd(precio["dr_unitario_usd"]),
-    "TRM": f"{trm:,.2f}",
-    "Costo licencias/producto COP": formato_cop(resultado["costo_licencias_cop"]),
-    "Venta licencias/producto COP": formato_cop(resultado["precio_venta_licencias_cop"]),
-    "Costo instalación COP": formato_cop(resultado["costo_instalacion_cop"]),
-    "Venta instalación COP": formato_cop(resultado["precio_venta_instalacion_cop"]),
-    "Total cliente COP": formato_cop(resultado["precio_venta_total_cop"]),
+cols = st.columns(4)
+
+with cols[0]:
+    render_result_card(
+        "Venta componente principal",
+        formato_cop(detalle_componentes[0]["venta_cop"]),
+        detalle_componentes[0]["descripcion"],
+        "blue",
+    )
+
+with cols[1]:
+    if len(detalle_componentes) > 1:
+        render_result_card(
+            "Venta componente adicional",
+            formato_cop(detalle_componentes[1]["venta_cop"]),
+            detalle_componentes[1]["descripcion"],
+            "blue",
+        )
+    else:
+        render_result_card(
+            "Componente adicional",
+            formato_cop(0),
+            "No incluido",
+            "blue",
+        )
+
+with cols[2]:
+    render_result_card(
+        "Venta instalación",
+        formato_cop(resultado["precio_venta_instalacion_cop"]),
+        tipo_instalacion,
+        "yellow",
+    )
+
+with cols[3]:
+    render_result_card(
+        "Total cliente",
+        formato_cop(resultado["precio_venta_total_cop"]),
+        "Valor total estimado",
+        "green",
+    )
+
+st.markdown("</div>", unsafe_allow_html=True)
+
+
+st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
+st.markdown('<div class="mc-section-title">Generar oferta Endpoint / EDR / XDR</div>', unsafe_allow_html=True)
+
+secciones = []
+
+for componente in detalle_componentes:
+    key = key_seccion_endpoint(componente["familia"])
+    if key:
+        secciones.append(key)
+
+datos_endpoint_word = {
+    "familia": familia,
+    "vigencia": vigencia,
+    "secciones": secciones,
+    "componentes": detalle_componentes,
+    "venta_instalacion": resultado["precio_venta_instalacion_cop"],
+    "total_cliente": resultado["precio_venta_total_cop"],
 }
 
-if familia == "Firewall":
-    detalle_producto.update({
-        "Tipo de venta Firewall": tipo_venta_firewall,
-        "Cantidad de firewalls": cantidad_firewalls,
-        "Venta equipo COP": formato_cop(detalle_venta_firewall["venta_equipo_cop"]),
-        f"Venta licencia {vigencia} meses COP": formato_cop(detalle_venta_firewall["venta_licencia_cop"]),
-    })
+if not TEMPLATE_ENDPOINT_FILE.exists():
+    st.error("No se encontró assets/oferta_endpoint.docx")
+else:
+    archivo_endpoint = generar_oferta_endpoint_word(datos_endpoint_word)
 
-st.dataframe(pd.DataFrame([detalle_producto]), use_container_width=True, hide_index=True)
-st.markdown('</div>', unsafe_allow_html=True)
+    st.download_button(
+        label="📄 Generar oferta Endpoint en Word",
+        data=archivo_endpoint,
+        file_name=nombre_archivo_oferta(familia, "Endpoint"),
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        use_container_width=True,
+    )
 
+st.markdown("</div>", unsafe_allow_html=True)
 
-# ============================================================
-# RESUMEN COMERCIAL
-# ============================================================
 
 st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
-st.markdown('<div class="mc-section-title">Resumen comercial</div>', unsafe_allow_html=True)
+st.markdown('<div class="mc-section-title">Detalle de componentes cotizados</div>', unsafe_allow_html=True)
 
-if familia == "Firewall":
-    tabla_resumen_cliente = pd.DataFrame([
-        {
-            "Concepto": f"Equipo Sophos {precio['producto']}",
-            "Valor COP": formato_cop(detalle_venta_firewall["venta_equipo_cop"])
-        },
-        {
-            "Concepto": f"Licencia Sophos {precio['producto']} - {vigencia} meses",
-            "Valor COP": formato_cop(detalle_venta_firewall["venta_licencia_cop"])
-        },
-        {
-            "Concepto": "Instalación",
-            "Valor COP": formato_cop(resultado["precio_venta_instalacion_cop"])
-        },
-        {
-            "Concepto": "Total a presentar al cliente",
-            "Valor COP": formato_cop(resultado["precio_venta_total_cop"])
-        },
-    ])
-else:
-    tabla_resumen_cliente = pd.DataFrame([
-        {
-            "Concepto": "Licencias / producto",
-            "Valor COP": formato_cop(resultado["precio_venta_licencias_cop"])
-        },
-        {
-            "Concepto": "Instalación",
-            "Valor COP": formato_cop(resultado["precio_venta_instalacion_cop"])
-        },
-        {
-            "Concepto": "Total a presentar al cliente",
-            "Valor COP": formato_cop(resultado["precio_venta_total_cop"])
-        },
-    ])
+tabla_componentes = []
 
-st.dataframe(tabla_resumen_cliente, use_container_width=True, hide_index=True)
-st.markdown('</div>', unsafe_allow_html=True)
+for c in detalle_componentes:
+    tabla_componentes.append(
+        {
+            "Producto": c["descripcion"],
+            "Cantidad": c["cantidad"],
+            "Vigencia": f"{c['vigencia']} meses",
+            "MSRP USD": formato_usd(c["msrp_usd"]),
+            "DR USD": formato_usd(c["dr_usd"]),
+            "Valor COP": formato_cop(c["venta_cop"]),
+        }
+    )
 
+if resultado["precio_venta_instalacion_cop"] > 0:
+    tabla_componentes.append(
+        {
+            "Producto": "Instalación y puesta en marcha",
+            "Cantidad": 1,
+            "Vigencia": "Única vez",
+            "MSRP USD": "-",
+            "DR USD": "-",
+            "Valor COP": formato_cop(resultado["precio_venta_instalacion_cop"]),
+        }
+    )
 
-# ============================================================
-# RESULTADO FINANCIERO
-# ============================================================
+tabla_componentes.append(
+    {
+        "Producto": "Total a presentar al cliente",
+        "Cantidad": "-",
+        "Vigencia": "-",
+        "MSRP USD": formato_usd(msrp_total),
+        "DR USD": formato_usd(dr_total),
+        "Valor COP": formato_cop(resultado["precio_venta_total_cop"]),
+    }
+)
+
+st.dataframe(pd.DataFrame(tabla_componentes), use_container_width=True, hide_index=True)
+st.markdown("</div>", unsafe_allow_html=True)
+
 
 st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
 st.markdown('<div class="mc-section-title">Resultado financiero del negocio</div>', unsafe_allow_html=True)
 
-tabla_financiera = pd.DataFrame([
-    {
-        "Concepto": "Precio de venta total",
-        "%": "100,0%",
-        "Valor COP": formato_cop(resultado["precio_venta_total_cop"])
-    },
-    {
-        "Concepto": "Costo total",
-        "%": formato_porcentaje(resultado["porcentaje_costo"]),
-        "Valor COP": formato_cop(resultado["costo_total_cop"])
-    },
-    {
-        "Concepto": "Utilidad bruta",
-        "%": formato_porcentaje(resultado["porcentaje_utilidad_bruta"]),
-        "Valor COP": formato_cop(resultado["utilidad_bruta_cop"])
-    },
-    {
-        "Concepto": "Impuestos",
-        "%": formato_porcentaje(IMPUESTOS),
-        "Valor COP": formato_cop(resultado["impuestos_cop"])
-    },
-    {
-        "Concepto": "Gastos",
-        "%": formato_porcentaje(GASTOS),
-        "Valor COP": formato_cop(resultado["gastos_cop"])
-    },
-    {
-        "Concepto": "Margen contribucional",
-        "%": formato_porcentaje(resultado["porcentaje_margen_contribucional"]),
-        "Valor COP": formato_cop(resultado["margen_contribucional_cop"])
-    },
-    {
-        "Concepto": "Carga prestacional de la comisión",
-        "%": formato_porcentaje(CARGA_PRESTACIONAL_COMISION),
-        "Valor COP": formato_cop(resultado["carga_prestacional_cop"])
-    },
-    {
-        "Concepto": "Comisión",
-        "%": formato_porcentaje(COMISION),
-        "Valor COP": formato_cop(resultado["comision_cop"])
-    },
-    {
-        "Concepto": "Utilidad EBIT",
-        "%": formato_porcentaje(resultado["porcentaje_ebit"]),
-        "Valor COP": formato_cop(resultado["utilidad_ebit_cop"])
-    },
-    {
-        "Concepto": "EBIT / Costo",
-        "%": formato_porcentaje(resultado["ebit_sobre_costo"]),
-        "Valor COP": "-"
-    },
-])
+tabla_financiera = pd.DataFrame(
+    [
+        {
+            "Concepto": "Precio de venta total",
+            "%": "100,0%",
+            "Valor COP": formato_cop(resultado["precio_venta_total_cop"]),
+        },
+        {
+            "Concepto": "Costo total",
+            "%": formato_porcentaje(resultado["porcentaje_costo"]),
+            "Valor COP": formato_cop(resultado["costo_total_cop"]),
+        },
+        {
+            "Concepto": "Utilidad bruta",
+            "%": formato_porcentaje(resultado["porcentaje_utilidad_bruta"]),
+            "Valor COP": formato_cop(resultado["utilidad_bruta_cop"]),
+        },
+        {
+            "Concepto": "Impuestos",
+            "%": formato_porcentaje(IMPUESTOS),
+            "Valor COP": formato_cop(resultado["impuestos_cop"]),
+        },
+        {
+            "Concepto": "Gastos",
+            "%": formato_porcentaje(GASTOS),
+            "Valor COP": formato_cop(resultado["gastos_cop"]),
+        },
+        {
+            "Concepto": "Margen contribucional",
+            "%": formato_porcentaje(resultado["porcentaje_margen_contribucional"]),
+            "Valor COP": formato_cop(resultado["margen_contribucional_cop"]),
+        },
+        {
+            "Concepto": "Carga prestacional de la comisión",
+            "%": formato_porcentaje(CARGA_PRESTACIONAL_COMISION),
+            "Valor COP": formato_cop(resultado["carga_prestacional_cop"]),
+        },
+        {
+            "Concepto": "Comisión",
+            "%": formato_porcentaje(COMISION),
+            "Valor COP": formato_cop(resultado["comision_cop"]),
+        },
+        {
+            "Concepto": "Utilidad EBIT",
+            "%": formato_porcentaje(resultado["porcentaje_ebit"]),
+            "Valor COP": formato_cop(resultado["utilidad_ebit_cop"]),
+        },
+        {
+            "Concepto": "EBIT / Costo",
+            "%": formato_porcentaje(resultado["ebit_sobre_costo"]),
+            "Valor COP": "-",
+        },
+    ]
+)
 
 st.dataframe(tabla_financiera, use_container_width=True, hide_index=True)
-st.markdown('</div>', unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
 
-
-# ============================================================
-# VALIDACIÓN COMERCIAL
-# ============================================================
 
 st.markdown('<div class="mc-panel">', unsafe_allow_html=True)
 st.markdown('<div class="mc-section-title">Validación comercial</div>', unsafe_allow_html=True)
@@ -1322,50 +2221,22 @@ elif ebit_costo >= 0.08:
 else:
     st.error("Negocio sensible: rentabilidad baja. Requiere revisión antes de presentar al cliente.")
 
-st.markdown('</div>', unsafe_allow_html=True)
+st.markdown("</div>", unsafe_allow_html=True)
 
-
-# ============================================================
-# VALIDACIÓN TÉCNICA
-# ============================================================
 
 with st.expander("Validación técnica del cálculo"):
-    st.write("Parámetros financieros usados:")
-    st.write({
-        "Porcentaje costo sobre venta": formato_porcentaje(PORCENTAJE_COSTO_SOBRE_VENTA),
-        "Impuestos": formato_porcentaje(IMPUESTOS),
-        "Gastos": formato_porcentaje(GASTOS),
-        "Carga prestacional comisión": formato_porcentaje(CARGA_PRESTACIONAL_COMISION),
-        "Comisión": formato_porcentaje(COMISION),
-        "Costo instalación sobre venta licencias/producto": formato_porcentaje(PORCENTAJE_COSTO_INSTALACION),
-    })
+    st.write("Componentes usados:")
+    st.write(detalle_componentes)
 
-    valores_base = {
-        "MSRP USD total": msrp_usd,
-        "DR USD total": dr_usd,
-        "TRM": trm,
-        "Costo licencias/producto COP": resultado["costo_licencias_cop"],
-        "Venta licencias/producto COP": resultado["precio_venta_licencias_cop"],
-        "Costo instalación COP": resultado["costo_instalacion_cop"],
-        "Venta instalación COP": resultado["precio_venta_instalacion_cop"],
-        "Precio venta total COP": resultado["precio_venta_total_cop"],
-        "Costo total COP": resultado["costo_total_cop"],
-    }
+    st.write("Resultado financiero:")
+    st.write(resultado)
 
-    if familia == "Firewall":
-        valores_base.update({
-            "Tipo venta Firewall": tipo_venta_firewall,
-            "Cantidad firewalls": cantidad_firewalls,
-            "Venta equipo COP": detalle_venta_firewall["venta_equipo_cop"],
-            f"Venta licencia {vigencia} meses COP": detalle_venta_firewall["venta_licencia_cop"],
-        })
-
-    st.write(valores_base)
-
-with st.expander("Ver filas usadas del Excel"):
-    st.dataframe(precio["filas"], use_container_width=True)
+    st.write("Filas usadas del Excel:")
+    for p in precios_componentes:
+        st.write(f"Familia: {p['familia']}")
+        st.dataframe(p["filas"], use_container_width=True)
 
 st.markdown(
     '<div class="mc-footer-note">Media Commerce · Herramienta interna de estimación comercial · Seguridad Sophos SMB</div>',
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
